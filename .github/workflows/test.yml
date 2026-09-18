@@ -1,0 +1,60 @@
+name: Test encrypted bot and Upstash
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install age
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y age
+
+      - name: Decrypt bot archive
+        env:
+          BOT_AGE_PRIVATE_KEY: ${{ secrets.BOT_AGE_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$BOT_AGE_PRIVATE_KEY" > age-key.txt
+          age --decrypt -i age-key.txt cw-bot.tar.gz.age > cw-bot.tar.gz
+          mkdir extracted
+          tar -xzf cw-bot.tar.gz -C extracted
+          echo "Decryption successful."
+          find extracted -maxdepth 2 -type f -printf '%p\n'
+
+      - name: Test Upstash Redis
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: |
+          response=$(curl -sS \
+            -X POST \
+            -H "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN" \
+            -H "Content-Type: application/json" \
+            "$UPSTASH_REDIS_REST_URL/set/github_actions_test/working")
+
+          echo "SET response: $response"
+
+          response=$(curl -sS \
+            -H "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN" \
+            "$UPSTASH_REDIS_REST_URL/get/github_actions_test")
+
+          echo "GET response: $response"
+
+          if ! echo "$response" | grep -q '"result":"working"'; then
+            echo "Upstash test failed."
+            exit 1
+          fi
+
+          echo "Upstash test successful."
+
+      - name: Remove temporary secrets and decrypted files
+        if: always()
+        run: |
+          rm -f age-key.txt cw-bot.tar.gz
+          rm -rf extracted
