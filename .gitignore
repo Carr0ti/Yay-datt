@@ -1,0 +1,10 @@
+pk.txt
+state/
+auth-state/
+node_modules/
+.env
+*.log
+*.bak
+config.json.save*
+cw-bot.tar.gz
+test-decrypt/
