@@ -78,7 +78,7 @@ jobs:
 
           echo "Upstash test successful."
 
-        - name: Test bot with one account
+      - name: Test bot with one account
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
@@ -88,9 +88,6 @@ jobs:
 
           echo "Installing bot dependencies..."
           npm ci
-
-          printf '%s\n' "$CRAFT_WORLD_PRIVATE_KEYS" > pk.txt
-          chmod 600 pk.txt
 
           echo "Starting bot test..."
 
