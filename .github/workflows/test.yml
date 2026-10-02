@@ -21,11 +21,36 @@ jobs:
           BOT_AGE_PRIVATE_KEY: ${{ secrets.BOT_AGE_PRIVATE_KEY }}
         run: |
           printf '%s\n' "$BOT_AGE_PRIVATE_KEY" > age-key.txt
-          age --decrypt -i age-key.txt cw-bot.tar.gz.age > cw-bot.tar.gz
+
+          age --decrypt \
+            -i age-key.txt \
+            cw-bot.tar.gz.age \
+            > cw-bot.tar.gz
+
           mkdir extracted
           tar -xzf cw-bot.tar.gz -C extracted
+
           echo "Decryption successful."
           find extracted -maxdepth 2 -type f -printf '%p\n'
+
+      - name: Create temporary wallet key file
+        env:
+          CRAFT_WORLD_PRIVATE_KEYS: ${{ secrets.CRAFT_WORLD_PRIVATE_KEYS }}
+        run: |
+          printf '%s\n' "$CRAFT_WORLD_PRIVATE_KEYS" > extracted/pk.txt
+
+          chmod 600 extracted/pk.txt
+
+          key_count=$(grep -cve '^[[:space:]]*$' extracted/pk.txt || true)
+
+          echo "Wallet keys loaded: $key_count"
+
+          if [ "$key_count" -eq 0 ]; then
+            echo "No wallet keys were provided."
+            exit 1
+          fi
+
+          echo "Temporary pk.txt created successfully."
 
       - name: Test Upstash Redis
         env:
@@ -56,5 +81,9 @@ jobs:
       - name: Remove temporary secrets and decrypted files
         if: always()
         run: |
-          rm -f age-key.txt cw-bot.tar.gz
+          rm -f age-key.txt
+          rm -f cw-bot.tar.gz
+          rm -f extracted/pk.txt
           rm -rf extracted
+
+          echo "Temporary files removed."
