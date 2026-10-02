@@ -86,7 +86,10 @@ jobs:
         run: |
           cd extracted
 
-          printf '%s\n' "$CRAFT_WORLD_PRIVATE_KEYS" > pk.txt
+echo "Installing bot dependencies..."
+npm ci
+
+printf '%s\n' "$CRAFT_WORLD_PRIVATE_KEYS" > pk.txt
           chmod 600 pk.txt
 
           echo "Starting bot test..."
