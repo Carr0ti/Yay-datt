@@ -78,6 +78,30 @@ jobs:
 
           echo "Upstash test successful."
 
+      - name: Test bot with one account
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          CRAFT_WORLD_PRIVATE_KEYS: ${{ secrets.CRAFT_WORLD_PRIVATE_KEYS }}
+        run: |
+          cd extracted
+
+          printf '%s\n' "$CRAFT_WORLD_PRIVATE_KEYS" > pk.txt
+          chmod 600 pk.txt
+
+          echo "Starting bot test..."
+
+          timeout 90s npm start || status=$?
+
+          if [ "${status:-0}" -eq 124 ]; then
+            echo "Bot ran for 90 seconds. Test complete."
+          elif [ "${status:-0}" -ne 0 ]; then
+            echo "Bot exited with status ${status}."
+            exit "$status"
+          else
+            echo "Bot exited normally."
+          fi
+
       - name: Remove temporary secrets and decrypted files
         if: always()
         run: |
