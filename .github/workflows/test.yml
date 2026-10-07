@@ -3,12 +3,12 @@ name: Test encrypted bot and Upstash
 on:
   workflow_dispatch:
 
-  schedule:
-    - cron: "30 */5 * * *"
+schedule:
+  - cron: "30 * * * *"
 
 concurrency:
   group: craft-world-bot
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test:
