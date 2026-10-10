@@ -3,16 +3,19 @@ name: Test encrypted bot and Upstash
 on:
   workflow_dispatch:
 
-  schedule:
-    - cron: "30 * * * *"
-
-concurrency:
-  group: craft-world-bot
-  cancel-in-progress: false
-
 jobs:
   test:
+    name: Account ${{ matrix.account_index }}
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        account_index: [0]
+
+    concurrency:
+      group: craft-world-account-${{ matrix.account_index }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
@@ -27,44 +30,41 @@ jobs:
         env:
           BOT_AGE_PRIVATE_KEY: ${{ secrets.BOT_AGE_PRIVATE_KEY }}
         run: |
+          set -euo pipefail
           printf '%s\n' "$BOT_AGE_PRIVATE_KEY" > age-key.txt
 
-          age --decrypt \
-            -i age-key.txt \
-            cw-bot.tar.gz.age \
-            > cw-bot.tar.gz
+          age --decrypt -i age-key.txt cw-bot.tar.gz.age > cw-bot.tar.gz
 
           mkdir extracted
           tar -xzf cw-bot.tar.gz -C extracted
 
           echo "Decryption successful."
-          find extracted -maxdepth 2 -type f -printf '%p\n'
+          find extracted -maxdepth 1 -type f -printf '%f\n'
 
       - name: Create temporary wallet key file
         env:
           CRAFT_WORLD_PRIVATE_KEYS: ${{ secrets.CRAFT_WORLD_PRIVATE_KEYS }}
         run: |
+          set -euo pipefail
           printf '%s\n' "$CRAFT_WORLD_PRIVATE_KEYS" > extracted/pk.txt
-
           chmod 600 extracted/pk.txt
 
           key_count=$(grep -cve '^[[:space:]]*$' extracted/pk.txt || true)
-
           echo "Wallet keys loaded: $key_count"
 
           if [ "$key_count" -eq 0 ]; then
-            echo "No wallet keys were provided."
+            echo "No private keys were provided."
             exit 1
           fi
-
-          echo "Temporary pk.txt created successfully."
 
       - name: Test Upstash Redis
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
-          response=$(curl -sS \
+          set -euo pipefail
+
+          response=$(curl -fsS \
             -X POST \
             -H "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN" \
             -H "Content-Type: application/json" \
@@ -72,7 +72,7 @@ jobs:
 
           echo "SET response: $response"
 
-          response=$(curl -sS \
+          response=$(curl -fsS \
             -H "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN" \
             "$UPSTASH_REDIS_REST_URL/get/github_actions_test")
 
@@ -85,27 +85,24 @@ jobs:
 
           echo "Upstash test successful."
 
-      - name: Test bot with one account
+      - name: Run bot for selected account
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          CRAFT_WORLD_PRIVATE_KEYS: ${{ secrets.CRAFT_WORLD_PRIVATE_KEYS }}
+          CRAFT_WORLD_ACCOUNT_INDEX: ${{ matrix.account_index }}
         run: |
+          set -euo pipefail
           cd extracted
 
-          echo "Installing bot dependencies..."
           npm ci
 
-          echo "Starting bot test..."
-
+          echo "Starting bot for account index $CRAFT_WORLD_ACCOUNT_INDEX..."
           npm start
 
       - name: Remove temporary secrets and decrypted files
         if: always()
         run: |
-          rm -f age-key.txt
-          rm -f cw-bot.tar.gz
+          rm -f age-key.txt cw-bot.tar.gz
           rm -f extracted/pk.txt
           rm -rf extracted
-
           echo "Temporary files removed."
