@@ -1,0 +1,67 @@
+
+name: Test Camofox Browser
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Camofox
+        run: |
+          git clone --depth 1 \
+            https://github.com/jo-inc/camofox-browser.git \
+            /tmp/camofox-browser
+          cd /tmp/camofox-browser
+          npm install
+
+      - name: Start Camofox
+        run: |
+          cd /tmp/camofox-browser
+          npm start > /tmp/camofox.log 2>&1 &
+          echo $! > /tmp/camofox.pid
+
+      - name: Wait for Camofox
+        shell: bash
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS \
+              http://127.0.0.1:9377/health; then
+              echo
+              echo "Camofox started successfully."
+              exit 0
+            fi
+
+            if ! kill -0 "$(cat /tmp/camofox.pid)" \
+              2>/dev/null; then
+              cat /tmp/camofox.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Camofox health check timed out."
+          cat /tmp/camofox.log
+          exit 1
+
+      - name: Print logs
+        if: always()
+        run: |
+          if [ -f /tmp/camofox.log ]; then
+            tail -n 150 /tmp/camofox.log
+          fi
