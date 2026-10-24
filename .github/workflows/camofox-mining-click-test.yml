@@ -9,7 +9,7 @@ permissions:
 jobs:
   click-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -18,7 +18,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24.16.0'
+          node-version: '24'
 
       - name: Install Camofox
         run: |
@@ -28,6 +28,60 @@ jobs:
           cd /tmp/camofox-browser
           npm install
 
+      - name: Enable coordinate clicks in this runner
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("/tmp/camofox-browser/server.js")
+          s = p.read_text()
+
+          old = "const { userId, ref, selector } = req.body;"
+          new = "const { userId, ref, selector, coordinates } = req.body;"
+          if s.count(old) != 1:
+              raise SystemExit("Could not safely locate the click handler.")
+          s = s.replace(old, new, 1)
+
+          old = """if (!ref && !selector) {
+            return res.status(400).json({ error: 'ref or selector required' });
+          }"""
+          new = """if (!ref && !selector && !coordinates) {
+            return res.status(400).json({ error: 'ref, selector, or coordinates required' });
+          }
+          if (coordinates && (
+            !Number.isFinite(coordinates.x) ||
+            !Number.isFinite(coordinates.y) ||
+            coordinates.x < 0 ||
+            coordinates.y < 0
+          )) {
+            return res.status(400).json({ error: 'coordinates must contain non-negative numeric x and y' });
+          }"""
+          if s.count(old) != 1:
+              raise SystemExit("Could not safely locate click validation.")
+          s = s.replace(old, new, 1)
+
+          old = """      if (ref) {
+          let locator = refToLocator(tabState.page, ref, tabState.refs);"""
+          new = """      if (coordinates) {
+          const viewport = tabState.page.viewportSize();
+          if (!viewport ||
+              coordinates.x >= viewport.width ||
+              coordinates.y >= viewport.height) {
+            throw new Error('Click coordinates are outside the browser viewport');
+          }
+          await tabState.page.mouse.click(coordinates.x, coordinates.y);
+          log('info', 'coordinate mouse click dispatched', coordinates);
+        } else if (ref) {
+          let locator = refToLocator(tabState.page, ref, tabState.refs);"""
+          if s.count(old) != 1:
+              raise SystemExit("Could not safely locate click execution branch.")
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
+          print("Coordinate-click patch applied successfully.")
+          PY
+
       - name: Start Camofox
         run: |
           cd /tmp/camofox-browser
@@ -35,11 +89,13 @@ jobs:
           echo $! > /tmp/camofox.pid
 
       - name: Wait for Camofox
+        shell: bash
         run: |
           set -e
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:9377/health; then
-              echo "Camofox is ready"
+              echo
+              echo "Camofox is ready."
               exit 0
             fi
             if ! kill -0 "$(cat /tmp/camofox.pid)" 2>/dev/null; then
@@ -51,67 +107,74 @@ jobs:
           cat /tmp/camofox.log
           exit 1
 
-      - name: Open game and click yellow shovel once
+      - name: Open Craft World and inspect loading
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
           BASE_URL="http://127.0.0.1:9377"
           USER_ID="github-actions-craft-world-test"
           SESSION_KEY="craft-world-mining-click-test"
           OUT="/tmp/craft-world-click-test"
-
           mkdir -p "$OUT"
+
+          # Always preserve diagnostic output, even if a request fails.
+          request() {
+            curl -sS --max-time 30 "$@" || true
+          }
 
           tab_response=$(curl --retry 3 --retry-delay 2 \
             --retry-connrefused -fsS \
             -X POST "$BASE_URL/tabs" \
             -H 'Content-Type: application/json' \
-            -d "{\"userId\":\"$USER_ID\",\"sessionKey\":\"$SESSION_KEY\",\"url\":\"https://craft-world.gg\"}")
+            -d "{\"userId\":\"$USER_ID\",\"sessionKey\":\"$SESSION_KEY\",\"url\":\"https://craft-world.gg\"}") || {
+              echo "Could not create browser tab."
+              cat /tmp/camofox.log
+              exit 1
+            }
 
-          echo "$tab_response" | jq .
-          tab_id=$(echo "$tab_response" | jq -er '.tabId')
+          printf '%s\n' "$tab_response" | tee "$OUT/tab-response.json" | jq .
+          tab_id=$(printf '%s' "$tab_response" | jq -er '.tabId') || exit 1
 
-          curl -fsS -X POST \
-            "$BASE_URL/tabs/$tab_id/wait" \
+          echo "Waiting for the page to settle..."
+          request -X POST "$BASE_URL/tabs/$tab_id/wait" \
             -H 'Content-Type: application/json' \
-            -d "{\"userId\":\"$USER_ID\",\"timeout\":15000}" || true
+            -d "{\"userId\":\"$USER_ID\",\"timeout\":30000}" \
+            > "$OUT/wait-response.json"
 
-          sleep 10
+          # Give the game up to 120 seconds to finish its initial loading.
+          # This workflow records the screen for review before clicking.
+          for i in $(seq 1 12); do
+            echo "Loading check $i of 12..."
+            sleep 10
 
-          echo "Saving screenshot before clicking..."
-          curl -fsS --get \
-            --data-urlencode "userId=$USER_ID" \
-            "$BASE_URL/tabs/$tab_id/screenshot" \
-            -o "$OUT/before-click.png"
+            request --get \
+              --data-urlencode "userId=$USER_ID" \
+              "$BASE_URL/tabs/$tab_id/screenshot" \
+              -o "$OUT/screen-check-$i.png"
 
-          echo "Clicking the yellow shovel once..."
-          curl -fsS -X POST \
-            "$BASE_URL/tabs/$tab_id/click" \
-            -H 'Content-Type: application/json' \
-            -d "{\"userId\":\"$USER_ID\",\"coordinates\":{\"x\":635,\"y\":650}}" \
-            | tee "$OUT/click-response.json" | jq .
+            request --get \
+              --data-urlencode "userId=$USER_ID" \
+              "$BASE_URL/tabs/$tab_id/evaluate" \
+              > "$OUT/evaluate-check-$i.json" || true
 
-          sleep 5
+            # Ask the page for basic render diagnostics.
+            request -X POST "$BASE_URL/tabs/$tab_id/evaluate" \
+              -H 'Content-Type: application/json' \
+              -d "{\"userId\":\"$USER_ID\",\"expression\":\"JSON.stringify({url:location.href,title:document.title,bodyText:(document.body?.innerText||'').slice(0,1000),canvases:[...document.querySelectorAll('canvas')].map(c=>({width:c.width,height:c.height,rect:(()=>{const r=c.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height}})()}))})\"}" \
+              > "$OUT/page-check-$i.json"
 
-          echo "Saving screenshot after clicking..."
-          curl -fsS --get \
-            --data-urlencode "userId=$USER_ID" \
-            "$BASE_URL/tabs/$tab_id/screenshot" \
-            -o "$OUT/after-click.png"
+            cat "$OUT/page-check-$i.json" || true
+            echo
+          done
 
-          echo "Saving snapshot for diagnosis..."
-          curl -fsS --get \
-            --data-urlencode "userId=$USER_ID" \
-            "$BASE_URL/tabs/$tab_id/snapshot" \
-            -o "$OUT/snapshot-after-click.json" || true
+          # Keep the last screenshot as the review image.
+          cp "$OUT/screen-check-12.png" "$OUT/before-click.png" 2>/dev/null || true
 
-          if [ -s "$OUT/snapshot-after-click.json" ]; then
-            jq '{url, refsCount, totalChars, truncated, snapshot}' \
-              "$OUT/snapshot-after-click.json" || true
-          fi
-
-          echo "Click test finished. Check both screenshots."
+          echo "Loading inspection finished."
+          echo "No click has been sent yet."
+          echo "Review before-click.png to confirm the actual game screen."
+          echo "The shovel click will be enabled only after confirming the game is loaded."
 
       - name: Upload screenshots and diagnostics
         if: always()
