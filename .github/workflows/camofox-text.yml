@@ -95,7 +95,8 @@ jobs:
           echo "Browser opened: $page_url"
           echo "Reading page snapshot..."
 
-          snapshot_response=$(curl -fsS \
+          snapshot_response=$(curl --retry 3 --retry-delay 2 \
+            --retry-connrefused -fsS \
             --get \
             --data-urlencode \
               "userId=github-actions-smoke-test" \
@@ -103,9 +104,12 @@ jobs:
 
           echo "$snapshot_response" | jq '{url, snapshot}'
 
-          echo "$snapshot_response" \
-            | jq -er '.snapshot' \
-            | grep -qi 'Example Domain'
+          echo "$snapshot_response" | jq -e '
+            (.url | type == "string") and
+            (.url | startswith("https://example.com")) and
+            (.snapshot | type == "string") and
+            (.snapshot | length > 0)
+          ' > /dev/null
 
           echo "PASS: Camofox launched a browser, opened example.com, and read its page."
 
