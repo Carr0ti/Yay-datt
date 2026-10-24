@@ -22,14 +22,17 @@ jobs:
           node-version: '24.16.0'
 
       - name: Install Camofox
+        shell: bash
         run: |
           git clone --depth 1 \
             https://github.com/jo-inc/camofox-browser.git \
             /tmp/camofox-browser
+
           cd /tmp/camofox-browser
           npm install
 
       - name: Start Camofox
+        shell: bash
         run: |
           cd /tmp/camofox-browser
           npm start > /tmp/camofox.log 2>&1 &
@@ -38,16 +41,19 @@ jobs:
       - name: Wait for Camofox
         shell: bash
         run: |
+          set -euo pipefail
+
           for i in $(seq 1 60); do
             if curl -fsS \
               http://127.0.0.1:9377/health; then
               echo
-              echo "Camofox started successfully."
+              echo "Camofox server is responding."
               exit 0
             fi
 
             if ! kill -0 "$(cat /tmp/camofox.pid)" \
               2>/dev/null; then
+              echo "Camofox process stopped unexpectedly."
               cat /tmp/camofox.log
               exit 1
             fi
@@ -58,6 +64,50 @@ jobs:
           echo "Camofox health check timed out."
           cat /tmp/camofox.log
           exit 1
+
+      - name: Open webpage and verify browser snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Opening https://example.com..."
+
+          tab_response=$(curl --retry 3 --retry-delay 2 \
+            --retry-connrefused -fsS -X POST \
+            http://127.0.0.1:9377/tabs \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "userId": "github-actions-smoke-test",
+              "sessionKey": "webpage-test",
+              "url": "https://example.com"
+            }')
+
+          echo "$tab_response" | jq .
+
+          tab_id=$(echo "$tab_response" | jq -er '.tabId')
+          page_url=$(echo "$tab_response" | jq -er '.url')
+
+          if [[ "$page_url" != https://example.com* ]]; then
+            echo "Unexpected page URL: $page_url"
+            exit 1
+          fi
+
+          echo "Browser opened: $page_url"
+          echo "Reading page snapshot..."
+
+          snapshot_response=$(curl -fsS \
+            --get \
+            --data-urlencode \
+              "userId=github-actions-smoke-test" \
+            "http://127.0.0.1:9377/tabs/${tab_id}/snapshot")
+
+          echo "$snapshot_response" | jq '{url, snapshot}'
+
+          echo "$snapshot_response" \
+            | jq -er '.snapshot' \
+            | grep -qi 'Example Domain'
+
+          echo "PASS: Camofox launched a browser, opened example.com, and read its page."
 
       - name: Print logs
         if: always()
