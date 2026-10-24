@@ -51,9 +51,8 @@ jobs:
               exit 0
             fi
 
-            if ! kill -0 "$(cat /tmp/camofox.pid)" \
-              2>/dev/null; then
-              echo "Camofox process stopped unexpectedly."
+            if ! kill -0 "$(cat /tmp/camofox.pid)" 2>/dev/null; then
+              echo "Camofox process stopped."
               cat /tmp/camofox.log
               exit 1
             fi
@@ -65,56 +64,82 @@ jobs:
           cat /tmp/camofox.log
           exit 1
 
-      - name: Open webpage and verify browser snapshot
+      - name: Open Craft World and read snapshot
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Opening https://example.com..."
+          BASE_URL="http://127.0.0.1:9377"
+          USER_ID="github-actions-craft-world-test"
+          SESSION_KEY="craft-world-smoke-test"
+          TARGET_URL="https://craft-world.gg"
 
-          tab_response=$(curl --retry 3 --retry-delay 2 \
-            --retry-connrefused -fsS -X POST \
-            http://127.0.0.1:9377/tabs \
+          echo "Opening $TARGET_URL ..."
+
+          tab_response=$(curl \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-connrefused \
+            -fsS \
+            -X POST "$BASE_URL/tabs" \
             -H 'Content-Type: application/json' \
-            -d '{
-              "userId": "github-actions-smoke-test",
-              "sessionKey": "webpage-test",
-              "url": "https://example.com"
-            }')
+            -d "{
+              \"userId\": \"$USER_ID\",
+              \"sessionKey\": \"$SESSION_KEY\",
+              \"url\": \"$TARGET_URL\"
+            }")
 
           echo "$tab_response" | jq .
 
           tab_id=$(echo "$tab_response" | jq -er '.tabId')
-          page_url=$(echo "$tab_response" | jq -er '.url')
 
-          if [[ "$page_url" != https://example.com* ]]; then
-            echo "Unexpected page URL: $page_url"
+          echo "Tab ID: $tab_id"
+          echo "Waiting for the page to load..."
+          sleep 10
+
+          echo "Reading Craft World page snapshot..."
+
+          snapshot_response=$(curl \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-connrefused \
+            -fsS \
+            --get \
+            --data-urlencode "userId=$USER_ID" \
+            "$BASE_URL/tabs/$tab_id/snapshot")
+
+          echo "$snapshot_response" | jq '{
+            url: .url,
+            snapshot: .snapshot
+          }'
+
+          page_url=$(echo "$snapshot_response" | jq -r '.url // empty')
+          snapshot=$(echo "$snapshot_response" | jq -r '.snapshot // empty')
+
+          if [ -z "$page_url" ]; then
+            echo "FAIL: No page URL was returned."
             exit 1
           fi
 
-          echo "Browser opened: $page_url"
-          echo "Reading page snapshot..."
+          if [ -z "$snapshot" ]; then
+            echo "FAIL: The page snapshot is empty."
+            exit 1
+          fi
 
-          snapshot_response=$(curl --retry 3 --retry-delay 2 \
-            --retry-connrefused -fsS \
-            --get \
-            --data-urlencode \
-              "userId=github-actions-smoke-test" \
-            "http://127.0.0.1:9377/tabs/${tab_id}/snapshot")
+          echo
+          echo "PASS: Camofox opened a page and retrieved a non-empty snapshot."
+          echo "Final URL: $page_url"
 
-          echo "$snapshot_response" | jq '{url, snapshot}'
+          if [[ "$page_url" == *"craft-world.gg"* ]]; then
+            echo "The final URL belongs to craft-world.gg."
+          else
+            echo "NOTICE: The page redirected to another URL."
+            echo "Inspect the snapshot to identify a login or challenge page."
+          fi
 
-          echo "$snapshot_response" | jq -e '
-            (.url | type == "string") and
-            (.url | startswith("https://example.com")) and
-            (.snapshot | type == "string") and
-            (.snapshot | length > 0)
-          ' > /dev/null
-
-          echo "PASS: Camofox launched a browser, opened example.com, and read its page."
-
-      - name: Print logs
+      - name: Print Camofox logs
         if: always()
+        shell: bash
         run: |
           if [ -f /tmp/camofox.log ]; then
             tail -n 150 /tmp/camofox.log
