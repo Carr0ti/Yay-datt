@@ -1,0 +1,130 @@
+name: Test Craft World Mining Click
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  click-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.16.0'
+
+      - name: Install Camofox
+        run: |
+          git clone --depth 1 \
+            https://github.com/jo-inc/camofox-browser.git \
+            /tmp/camofox-browser
+          cd /tmp/camofox-browser
+          npm install
+
+      - name: Start Camofox
+        run: |
+          cd /tmp/camofox-browser
+          npm start > /tmp/camofox.log 2>&1 &
+          echo $! > /tmp/camofox.pid
+
+      - name: Wait for Camofox
+        run: |
+          set -e
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9377/health; then
+              echo "Camofox is ready"
+              exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/camofox.pid)" 2>/dev/null; then
+              cat /tmp/camofox.log
+              exit 1
+            fi
+            sleep 2
+          done
+          cat /tmp/camofox.log
+          exit 1
+
+      - name: Open game and click yellow shovel once
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_URL="http://127.0.0.1:9377"
+          USER_ID="github-actions-craft-world-test"
+          SESSION_KEY="craft-world-mining-click-test"
+          OUT="/tmp/craft-world-click-test"
+
+          mkdir -p "$OUT"
+
+          tab_response=$(curl --retry 3 --retry-delay 2 \
+            --retry-connrefused -fsS \
+            -X POST "$BASE_URL/tabs" \
+            -H 'Content-Type: application/json' \
+            -d "{\"userId\":\"$USER_ID\",\"sessionKey\":\"$SESSION_KEY\",\"url\":\"https://craft-world.gg\"}")
+
+          echo "$tab_response" | jq .
+          tab_id=$(echo "$tab_response" | jq -er '.tabId')
+
+          curl -fsS -X POST \
+            "$BASE_URL/tabs/$tab_id/wait" \
+            -H 'Content-Type: application/json' \
+            -d "{\"userId\":\"$USER_ID\",\"timeout\":15000}" || true
+
+          sleep 10
+
+          echo "Saving screenshot before clicking..."
+          curl -fsS --get \
+            --data-urlencode "userId=$USER_ID" \
+            "$BASE_URL/tabs/$tab_id/screenshot" \
+            -o "$OUT/before-click.png"
+
+          echo "Clicking the yellow shovel once..."
+          curl -fsS -X POST \
+            "$BASE_URL/tabs/$tab_id/click" \
+            -H 'Content-Type: application/json' \
+            -d "{\"userId\":\"$USER_ID\",\"coordinates\":{\"x\":635,\"y\":650}}" \
+            | tee "$OUT/click-response.json" | jq .
+
+          sleep 5
+
+          echo "Saving screenshot after clicking..."
+          curl -fsS --get \
+            --data-urlencode "userId=$USER_ID" \
+            "$BASE_URL/tabs/$tab_id/screenshot" \
+            -o "$OUT/after-click.png"
+
+          echo "Saving snapshot for diagnosis..."
+          curl -fsS --get \
+            --data-urlencode "userId=$USER_ID" \
+            "$BASE_URL/tabs/$tab_id/snapshot" \
+            -o "$OUT/snapshot-after-click.json" || true
+
+          if [ -s "$OUT/snapshot-after-click.json" ]; then
+            jq '{url, refsCount, totalChars, truncated, snapshot}' \
+              "$OUT/snapshot-after-click.json" || true
+          fi
+
+          echo "Click test finished. Check both screenshots."
+
+      - name: Upload screenshots and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: craft-world-mining-click-test
+          path: /tmp/craft-world-click-test/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Print Camofox logs
+        if: always()
+        run: |
+          if [ -f /tmp/camofox.log ]; then
+            tail -n 150 /tmp/camofox.log
+          fi
