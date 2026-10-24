@@ -28,54 +28,6 @@ jobs:
           cd /tmp/camofox-browser
           npm install
 
-      - name: Enable coordinate clicks in this runner
-        shell: bash
-        run: |
-          cat > /tmp/patch_camofox.py <<'PY'
-          from pathlib import Path
-
-          p = Path("/tmp/camofox-browser/server.js")
-          s = p.read_text()
-
-          old = "const { userId, ref, selector } = req.body;"
-          new = "const { userId, ref, selector, coordinates } = req.body;"
-          if s.count(old) != 1:
-              raise SystemExit("Could not safely locate the click handler.")
-          s = s.replace(old, new, 1)
-
-          old = """if (!ref && !selector) {
-              return res.status(400).json({ error: 'ref or selector required' });
-          }"""
-          new = """if (!ref && !selector && !coordinates) {
-              return res.status(400).json({ error: 'ref, selector, or coordinates required' });
-          }"""
-          if s.count(old) != 1:
-              raise SystemExit("Could not safely locate click validation.")
-          s = s.replace(old, new, 1)
-
-          old = "      if (ref) {"
-          new = """      if (coordinates) {
-                const viewport = tabState.page.viewportSize();
-                if (!viewport ||
-                    !Number.isFinite(coordinates.x) ||
-                    !Number.isFinite(coordinates.y) ||
-                    coordinates.x < 0 || coordinates.y < 0 ||
-                    coordinates.x >= viewport.width ||
-                    coordinates.y >= viewport.height) {
-                  throw new Error('Invalid click coordinates');
-                }
-                await tabState.page.mouse.click(coordinates.x, coordinates.y);
-                log('info', 'coordinate mouse click dispatched', coordinates);
-              } else if (ref) {"""
-          if s.count(old) != 1:
-              raise SystemExit("Could not safely locate click execution branch.")
-          s = s.replace(old, new, 1)
-
-          p.write_text(s)
-          print("Coordinate-click patch applied successfully.")
-          PY
-          python3 /tmp/patch_camofox.py
-
       - name: Start Camofox
         shell: bash
         run: |
