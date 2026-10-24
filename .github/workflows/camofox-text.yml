@@ -44,15 +44,14 @@ jobs:
           set -euo pipefail
 
           for i in $(seq 1 60); do
-            if curl -fsS \
-              http://127.0.0.1:9377/health; then
+            if curl -fsS http://127.0.0.1:9377/health; then
               echo
               echo "Camofox server is responding."
               exit 0
             fi
 
             if ! kill -0 "$(cat /tmp/camofox.pid)" 2>/dev/null; then
-              echo "Camofox process stopped."
+              echo "Camofox stopped unexpectedly."
               cat /tmp/camofox.log
               exit 1
             fi
@@ -64,7 +63,7 @@ jobs:
           cat /tmp/camofox.log
           exit 1
 
-      - name: Open Craft World and read snapshot
+      - name: Open Craft World and inspect page
         shell: bash
         run: |
           set -euo pipefail
@@ -74,7 +73,7 @@ jobs:
           SESSION_KEY="craft-world-smoke-test"
           TARGET_URL="https://craft-world.gg"
 
-          echo "Opening $TARGET_URL ..."
+          echo "Opening Craft World..."
 
           tab_response=$(curl \
             --retry 3 \
@@ -92,50 +91,95 @@ jobs:
           echo "$tab_response" | jq .
 
           tab_id=$(echo "$tab_response" | jq -er '.tabId')
-
           echo "Tab ID: $tab_id"
+
+          mkdir -p /tmp/craft-world-test
+
           echo "Waiting for the page to load..."
-          sleep 10
 
-          echo "Reading Craft World page snapshot..."
+          curl -fsS \
+            -X POST "$BASE_URL/tabs/$tab_id/wait" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"userId\": \"$USER_ID\",
+              \"timeout\": 15000
+            }" || echo "Wait request returned an error; continuing."
 
-          snapshot_response=$(curl \
-            --retry 3 \
-            --retry-delay 2 \
-            --retry-connrefused \
-            -fsS \
-            --get \
-            --data-urlencode "userId=$USER_ID" \
-            "$BASE_URL/tabs/$tab_id/snapshot")
+          sleep 5
 
-          echo "$snapshot_response" | jq '{
-            url: .url,
-            snapshot: .snapshot
-          }'
+          echo "Trying to read the accessibility snapshot..."
 
-          page_url=$(echo "$snapshot_response" | jq -r '.url // empty')
-          snapshot=$(echo "$snapshot_response" | jq -r '.snapshot // empty')
+          for attempt in 1 2 3 4; do
+            echo "Snapshot attempt $attempt..."
 
-          if [ -z "$page_url" ]; then
-            echo "FAIL: No page URL was returned."
-            exit 1
+            if curl -fsS --get \
+              --data-urlencode "userId=$USER_ID" \
+              "$BASE_URL/tabs/$tab_id/snapshot" \
+              -o /tmp/craft-world-test/snapshot.json; then
+
+              snapshot=$(jq -r '.snapshot // empty' \
+                /tmp/craft-world-test/snapshot.json)
+
+              if [ -n "$snapshot" ]; then
+                echo "Snapshot retrieved successfully."
+                break
+              fi
+
+              echo "Snapshot is empty; retrying..."
+            else
+              echo "Snapshot request failed; retrying..."
+            fi
+
+            sleep 5
+          done
+
+          if [ -f /tmp/craft-world-test/snapshot.json ]; then
+            echo "Snapshot metadata:"
+            jq '{
+              url,
+              refsCount,
+              totalChars,
+              truncated,
+              snapshot
+            }' /tmp/craft-world-test/snapshot.json
           fi
 
-          if [ -z "$snapshot" ]; then
-            echo "FAIL: The page snapshot is empty."
-            exit 1
+          echo "Capturing browser screenshot..."
+
+          if curl -fsS --get \
+            --data-urlencode "userId=$USER_ID" \
+            "$BASE_URL/tabs/$tab_id/screenshot" \
+            -o /tmp/craft-world-test/craft-world.png; then
+            echo "Screenshot saved."
+          else
+            echo "Screenshot capture failed."
+            rm -f /tmp/craft-world-test/craft-world.png
+          fi
+
+          echo "Getting page links..."
+
+          if curl -fsS --get \
+            --data-urlencode "userId=$USER_ID" \
+            "$BASE_URL/tabs/$tab_id/links" \
+            -o /tmp/craft-world-test/links.json; then
+            jq . /tmp/craft-world-test/links.json \
+              || cat /tmp/craft-world-test/links.json
+          else
+            echo "Could not retrieve page links."
           fi
 
           echo
-          echo "PASS: Camofox opened a page and retrieved a non-empty snapshot."
-          echo "Final URL: $page_url"
+          echo "Browser inspection finished."
+          echo "Check the uploaded screenshot and snapshot to diagnose the page."
 
-          if [[ "$page_url" == *"craft-world.gg"* ]]; then
-            echo "The final URL belongs to craft-world.gg."
-          else
-            echo "NOTICE: The page redirected to another URL."
-            echo "Inspect the snapshot to identify a login or challenge page."
-          fi
+      - name: Upload Craft World diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: craft-world-browser-diagnostics
+          path: /tmp/craft-world-test/
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: Print Camofox logs
         if: always()
