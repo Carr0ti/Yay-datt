@@ -1,0 +1,182 @@
+
+name: Test Craft World Mining Click
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  click-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install Camofox
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/jo-inc/camofox-browser.git /tmp/camofox-browser
+          cd /tmp/camofox-browser
+          npm install
+
+      - name: Start Camofox
+        shell: bash
+        run: |
+          cd /tmp/camofox-browser
+          npm start > /tmp/camofox.log 2>&1 &
+          echo $! > /tmp/camofox.pid
+
+      - name: Wait for Camofox
+        shell: bash
+        run: |
+          set -e
+
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9377/health; then
+              echo
+              echo "Camofox is ready."
+              exit 0
+            fi
+
+            if ! kill -0 "$(cat /tmp/camofox.pid)" 2>/dev/null; then
+              cat /tmp/camofox.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          cat /tmp/camofox.log
+          exit 1
+
+      - name: Open game and inspect loading
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_URL="http://127.0.0.1:9377"
+          USER_ID="github-actions-craft-world-test"
+          SESSION_KEY="craft-world-mining-click-test"
+          OUT="/tmp/craft-world-click-test"
+
+          mkdir -p "$OUT"
+
+          tab_response=$(curl --retry 3 --retry-delay 2 \
+            --retry-connrefused -fsS \
+            -X POST "$BASE_URL/tabs" \
+            -H 'Content-Type: application/json' \
+            -d "{\"userId\":\"$USER_ID\",\"sessionKey\":\"$SESSION_KEY\",\"url\":\"https://craft-world.gg\"}")
+
+          printf '%s\n' "$tab_response" | tee "$OUT/tab-response.json" | jq .
+          tab_id=$(printf '%s' "$tab_response" | jq -er '.tabId')
+
+          echo "Waiting for initial page readiness..."
+          curl -sS --max-time 40 \
+            -X POST "$BASE_URL/tabs/$tab_id/wait" \
+            -H 'Content-Type: application/json' \
+            -d "{\"userId\":\"$USER_ID\",\"timeout\":30000}" \
+            > "$OUT/wait-response.json" || true
+
+          # Give the game time to render and record diagnostic screenshots.
+          for i in $(seq 1 6); do
+            echo "Loading check $i of 6..."
+            sleep 10
+
+            curl -fsS --max-time 30 --get \
+              --data-urlencode "userId=$USER_ID" \
+              "$BASE_URL/tabs/$tab_id/screenshot" \
+              -o "$OUT/screen-check-$i.json"
+
+            curl -fsS --max-time 30 \
+              -X POST "$BASE_URL/tabs/$tab_id/evaluate" \
+              -H 'Content-Type: application/json' \
+              -d "{\"userId\":\"$USER_ID\",\"expression\":\"JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,viewport:{width:innerWidth,height:innerHeight},canvases:[...document.querySelectorAll('canvas')].map(c=>{const r=c.getBoundingClientRect();return {width:c.width,height:c.height,x:r.x,y:r.y,displayWidth:r.width,displayHeight:r.height}})})\"}" \
+              > "$OUT/page-check-$i.json"
+
+            cat "$OUT/page-check-$i.json"
+            echo
+          done
+
+          # Save a fresh screenshot immediately before the click.
+          curl -fsS --max-time 30 --get \
+            --data-urlencode "userId=$USER_ID" \
+            "$BASE_URL/tabs/$tab_id/screenshot" \
+            -o "$OUT/before-click.json"
+
+          state_response=$(curl -fsS --max-time 30 \
+            -X POST "$BASE_URL/tabs/$tab_id/evaluate" \
+            -H 'Content-Type: application/json' \
+            -d "{\"userId\":\"$USER_ID\",\"expression\":\"JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,viewport:{width:innerWidth,height:innerHeight},canvases:[...document.querySelectorAll('canvas')].map(c=>{const r=c.getBoundingClientRect();return {width:c.width,height:c.height,x:r.x,y:r.y,displayWidth:r.width,displayHeight:r.height}})})\"}")
+
+          printf '%s\n' "$state_response" | tee "$OUT/pre-click-state.json" | jq .
+
+          state_json=$(printf '%s' "$state_response" | jq -er '.result | fromjson')
+          viewport_width=$(printf '%s' "$state_json" | jq -er '.viewport.width')
+          viewport_height=$(printf '%s' "$state_json" | jq -er '.viewport.height')
+          canvas_count=$(printf '%s' "$state_json" | jq -er '.canvases | length')
+          page_url=$(printf '%s' "$state_json" | jq -er '.url')
+
+          # Safety checks: do not click if navigation or canvas checks fail.
+          if [[ "$page_url" != "https://craft-world.gg/" && "$page_url" != "https://craft-world.gg" ]]; then
+            echo "Unexpected URL. No click sent."
+            exit 1
+          fi
+
+          if [ "$canvas_count" -lt 1 ] || \
+             [ "$viewport_width" -lt 1000 ] || \
+             [ "$viewport_height" -lt 700 ]; then
+            echo "Canvas or viewport safety check failed. No click sent."
+            exit 1
+          fi
+
+          # Approximate shovel position from the supplied 1664x832 screenshot:
+          # x=804 (48.3% width), y=511 (61.4% height).
+          # Scale those proportions to the actual viewport.
+          click_x=$(awk -v w="$viewport_width" 'BEGIN { printf "%d", w * 0.483 }')
+          click_y=$(awk -v h="$viewport_height" 'BEGIN { printf "%d", h * 0.614 }')
+
+          echo "Viewport: ${viewport_width}x${viewport_height}"
+          echo "Planned single click: x=$click_x y=$click_y"
+
+          # Exactly one click request.
+          click_response=$(curl -fsS --max-time 30 \
+            -X POST "$BASE_URL/tabs/$tab_id/click" \
+            -H 'Content-Type: application/json' \
+            -d "{\"userId\":\"$USER_ID\",\"coordinates\":{\"x\":$click_x,\"y\":$click_y}}")
+
+          printf '%s\n' "$click_response" | tee "$OUT/click-response.json" | jq .
+
+          sleep 5
+
+          curl -fsS --max-time 30 --get \
+            --data-urlencode "userId=$USER_ID" \
+            "$BASE_URL/tabs/$tab_id/screenshot" \
+            -o "$OUT/after-click.json"
+
+          echo "Single-click test completed."
+          echo "Compare before-click.json and after-click.json."
+
+      - name: Upload screenshots and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: craft-world-mining-click-test
+          path: /tmp/craft-world-click-test/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Print Camofox logs
+        if: always()
+        run: |
+          if [ -f /tmp/camofox.log ]; then
+            tail -n 150 /tmp/camofox.log
+          fi
