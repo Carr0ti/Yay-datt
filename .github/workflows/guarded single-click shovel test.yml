@@ -96,13 +96,17 @@ jobs:
 
           tab_id=$(printf '%s' "$tab_response" | jq -er '.tabId')
 
-          echo "Waiting for Craft World to load..."
+          echo "$tab_id" > "$OUT/tab-id.txt"
+          echo "$USER_ID" > "$OUT/user-id.txt"
+
+          echo "Waiting for initial page load..."
           sleep 20
 
           expression='JSON.stringify({
             url: location.href,
             title: document.title,
             readyState: document.readyState,
+            bodyText: (document.body?.innerText || "").slice(0, 3000),
             viewport: {
               width: innerWidth,
               height: innerHeight
@@ -117,11 +121,19 @@ jobs:
                 displayWidth: r.width,
                 displayHeight: r.height
               };
-            })
+            }),
+            resources: performance.getEntriesByType("resource")
+              .filter(r => /\.(js|wasm|json)(\?|$)/i.test(r.name))
+              .slice(-50)
+              .map(r => ({
+                url: r.name.slice(0, 250),
+                duration: Math.round(r.duration),
+                transferSize: r.transferSize
+              }))
           })'
 
           state_code=$(curl -sS --max-time 30 \
-            -o "$OUT/pre-click-state.json" \
+            -o "$OUT/page-diagnostics.json" \
             -w '%{http_code}' \
             -X POST "$BASE_URL/tabs/$tab_id/evaluate" \
             -H 'Content-Type: application/json' \
@@ -131,45 +143,30 @@ jobs:
               '{userId:$userId,expression:$expression}')" \
             || true)
 
-          echo "Page inspection HTTP status: $state_code"
-          cat "$OUT/pre-click-state.json"
-          echo
+          echo "Page diagnostics HTTP status: $state_code"
+          jq . "$OUT/page-diagnostics.json" 2>/dev/null \
+            || cat "$OUT/page-diagnostics.json" 2>/dev/null || true
 
           if [ "$state_code" != "200" ]; then
-            echo "Page inspection failed."
+            echo "Could not inspect the page."
             tail -n 150 /tmp/camofox.log
             exit 1
           fi
 
-          jq . "$OUT/pre-click-state.json"
-
           state_json=$(jq -er '.result | fromjson' \
-            "$OUT/pre-click-state.json")
+            "$OUT/page-diagnostics.json")
 
-          page_url=$(printf '%s' "$state_json" | jq -er '.url')
-          canvas_count=$(printf '%s' "$state_json" \
-            | jq -er '.canvases | length')
+          printf '%s\n' "$state_json" \
+            | tee "$OUT/page-state.json" | jq .
+
+          page_url=$(printf '%s' "$state_json" | jq -r '.url')
           viewport_width=$(printf '%s' "$state_json" \
-            | jq -er '.viewport.width')
+            | jq -r '.viewport.width')
           viewport_height=$(printf '%s' "$state_json" \
-            | jq -er '.viewport.height')
+            | jq -r '.viewport.height')
 
           echo "Page URL: $page_url"
-          echo "Canvas count: $canvas_count"
           echo "Viewport: ${viewport_width}x${viewport_height}"
-
-          if [[ "$page_url" != "https://craft-world.gg/" &&
-                "$page_url" != "https://craft-world.gg" ]]; then
-            echo "Unexpected page URL. Stopping without clicking."
-            exit 1
-          fi
-
-          if [ "$canvas_count" -lt 1 ] ||
-             [ "$viewport_width" -lt 1000 ] ||
-             [ "$viewport_height" -lt 700 ]; then
-            echo "Canvas or viewport check failed."
-            exit 1
-          fi
 
           before_code=$(curl -sS --max-time 30 --get \
             --data-urlencode "userId=$USER_ID" \
@@ -178,19 +175,26 @@ jobs:
             "$BASE_URL/tabs/$tab_id/screenshot" || true)
 
           echo "Before screenshot HTTP status: $before_code"
+          file "$OUT/before-click.png" 2>/dev/null || true
 
           if [ "$before_code" != "200" ]; then
-            cat "$OUT/before-click.png" 2>/dev/null || true
-            tail -n 100 /tmp/camofox.log
+            echo "Screenshot failed."
             exit 1
           fi
 
-          file "$OUT/before-click.png"
+          if [[ "$page_url" != "https://craft-world.gg/" &&
+                "$page_url" != "https://craft-world.gg" ]]; then
+            echo "Unexpected URL; native click will be skipped."
+            exit 1
+          fi
 
-          printf '%s\n' "$tab_id" > "$OUT/tab-id.txt"
-          printf '%s\n' "$USER_ID" > "$OUT/user-id.txt"
+          if [ "$viewport_width" -lt 1000 ] ||
+             [ "$viewport_height" -lt 700 ]; then
+            echo "Unexpected viewport; native click will be skipped."
+            exit 1
+          fi
 
-      - name: Attempt one guarded canvas click
+      - name: Attempt one native browser click
         shell: bash
         run: |
           set -euo pipefail
@@ -201,114 +205,82 @@ jobs:
           USER_ID=$(cat "$OUT/user-id.txt")
           tab_id=$(cat "$OUT/tab-id.txt")
 
-          state_json=$(jq -er '.result | fromjson' \
-            "$OUT/pre-click-state.json")
+          state_json=$(jq -er '.' "$OUT/page-state.json")
 
           viewport_width=$(printf '%s' "$state_json" \
             | jq -er '.viewport.width')
           viewport_height=$(printf '%s' "$state_json" \
             | jq -er '.viewport.height')
 
-          # Approximate target based on the screenshot supplied earlier.
           click_x=$(awk -v w="$viewport_width" \
             'BEGIN { printf "%d", w * 0.483 }')
           click_y=$(awk -v h="$viewport_height" \
             'BEGIN { printf "%d", h * 0.614 }')
 
           echo "Viewport: ${viewport_width}x${viewport_height}"
-          echo "Planned click: x=$click_x y=$click_y"
+          echo "Attempting native click at x=$click_x y=$click_y"
 
-          # No "view: window" property: this fixes the reported exception.
-          # Synthetic events may still be ignored by the game.
-          expression="(()=> {
-            const x = $click_x;
-            const y = $click_y;
-            const el = document.elementFromPoint(x, y);
+          click_code=$(curl -sS --max-time 30 \
+            -o "$OUT/native-click-response.json" \
+            -w '%{http_code}' \
+            -X POST "$BASE_URL/tabs/$tab_id/click" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -cn \
+              --arg userId "$USER_ID" \
+              --argjson x "$click_x" \
+              --argjson y "$click_y" \
+              '{userId:$userId,coordinates:{x:$x,y:$y}}')" \
+            || true)
 
-            if (!el || el.tagName.toLowerCase() !== 'canvas') {
-              return JSON.stringify({
-                ok: false,
-                error: 'Target is not a canvas; no events sent',
-                target: el ? el.tagName : null,
-                x, y
-              });
-            }
+          echo "Native click HTTP status: $click_code"
+          jq . "$OUT/native-click-response.json" 2>/dev/null \
+            || cat "$OUT/native-click-response.json" 2>/dev/null \
+            || true
 
-            const pointerOptions = {
-              bubbles: true,
-              cancelable: true,
-              clientX: x,
-              clientY: y,
-              button: 0,
-              pointerId: 1,
-              pointerType: 'mouse',
-              isPrimary: true
-            };
+          if [ "$click_code" != "200" ]; then
+            echo "Native click was rejected. See response above."
+            echo "No successful click is claimed."
+          else
+            echo "Click endpoint accepted the request."
+            echo "This does not prove the game registered the click."
+          fi
 
-            el.dispatchEvent(new PointerEvent('pointermove', {
-              ...pointerOptions,
-              buttons: 0
-            }));
+          echo "Waiting five seconds before taking another screenshot..."
+          sleep 5
 
-            el.dispatchEvent(new MouseEvent('mousemove', {
-              bubbles: true,
-              cancelable: true,
-              clientX: x,
-              clientY: y,
-              button: 0,
-              buttons: 0
-            }));
+          after_code=$(curl -sS --max-time 30 --get \
+            --data-urlencode "userId=$USER_ID" \
+            -o "$OUT/after-click.png" \
+            -w '%{http_code}' \
+            "$BASE_URL/tabs/$tab_id/screenshot" || true)
 
-            el.dispatchEvent(new PointerEvent('pointerdown', {
-              ...pointerOptions,
-              buttons: 1
-            }));
+          echo "After-click screenshot HTTP status: $after_code"
+          file "$OUT/after-click.png" 2>/dev/null || true
 
-            el.dispatchEvent(new MouseEvent('mousedown', {
-              bubbles: true,
-              cancelable: true,
-              clientX: x,
-              clientY: y,
-              button: 0,
-              buttons: 1
-            }));
+          if [ "$after_code" != "200" ]; then
+            echo "Could not capture the after-click screenshot."
+          fi
 
-            el.dispatchEvent(new PointerEvent('pointerup', {
-              ...pointerOptions,
-              buttons: 0
-            }));
+          echo "Collecting final page state..."
 
-            el.dispatchEvent(new MouseEvent('mouseup', {
-              bubbles: true,
-              cancelable: true,
-              clientX: x,
-              clientY: y,
-              button: 0,
-              buttons: 0
-            }));
+          expression='JSON.stringify({
+            url: location.href,
+            title: document.title,
+            readyState: document.readyState,
+            bodyText: (document.body?.innerText || "").slice(0, 3000),
+            canvasCount: document.querySelectorAll("canvas").length,
+            resources: performance.getEntriesByType("resource")
+              .filter(r => r.duration > 0)
+              .slice(-30)
+              .map(r => ({
+                url: r.name.slice(0, 250),
+                duration: Math.round(r.duration),
+                transferSize: r.transferSize
+              }))
+          })'
 
-            el.dispatchEvent(new MouseEvent('click', {
-              bubbles: true,
-              cancelable: true,
-              clientX: x,
-              clientY: y,
-              button: 0,
-              buttons: 0
-            }));
-
-            return JSON.stringify({
-              ok: true,
-              method: 'synthetic canvas events',
-              x, y,
-              target: el.tagName,
-              warning: 'Game may ignore synthetic events'
-            });
-          })()"
-
-          echo "Sending guarded test request..."
-
-          http_code=$(curl -sS --max-time 30 \
-            -o "$OUT/camofox-response.txt" \
+          final_code=$(curl -sS --max-time 30 \
+            -o "$OUT/final-page-state.json" \
             -w '%{http_code}' \
             -X POST "$BASE_URL/tabs/$tab_id/evaluate" \
             -H 'Content-Type: application/json' \
@@ -318,52 +290,13 @@ jobs:
               '{userId:$userId,expression:$expression}')" \
             || true)
 
-          echo "Camofox evaluate HTTP status: $http_code"
-          echo "Camofox response body:"
-          cat "$OUT/camofox-response.txt" 2>/dev/null || true
-          echo
+          echo "Final page inspection HTTP status: $final_code"
+          jq . "$OUT/final-page-state.json" 2>/dev/null \
+            || cat "$OUT/final-page-state.json" 2>/dev/null || true
 
-          echo "Recent Camofox server log:"
+          echo "Recent Camofox logs:"
           tail -n 150 /tmp/camofox.log \
             | tee "$OUT/camofox-server.log"
-
-          if [ "$http_code" != "200" ]; then
-            echo "Evaluate failed. No successful click is claimed."
-            exit 1
-          fi
-
-          click_response=$(cat "$OUT/camofox-response.txt")
-
-          printf '%s\n' "$click_response" \
-            | tee "$OUT/click-response.json" | jq .
-
-          result=$(printf '%s' "$click_response" \
-            | jq -er '.result | fromjson')
-
-          if [ "$(printf '%s' "$result" | jq -r '.ok')" != "true" ]; then
-            echo "Target check failed; no events were sent."
-            exit 1
-          fi
-
-          echo "Synthetic events dispatched. Waiting five seconds..."
-          sleep 5
-
-          after_code=$(curl -sS --max-time 30 --get \
-            --data-urlencode "userId=$USER_ID" \
-            -o "$OUT/after-click.png" \
-            -w '%{http_code}' \
-            "$BASE_URL/tabs/$tab_id/screenshot" || true)
-
-          echo "After screenshot HTTP status: $after_code"
-
-          if [ "$after_code" != "200" ]; then
-            cat "$OUT/after-click.png" 2>/dev/null || true
-            tail -n 100 /tmp/camofox.log
-            exit 1
-          fi
-
-          file "$OUT/after-click.png"
-          echo "Post-test screenshot saved."
 
       - name: Upload screenshots and diagnostics
         if: always()
