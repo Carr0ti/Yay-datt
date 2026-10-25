@@ -1,5 +1,5 @@
 
-name: Test Craft World Mining Click
+name: Test CW Mining Click
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "26.1.0"
+          node-version: "24"
 
       - name: Install Camofox
         shell: bash
@@ -96,10 +96,9 @@ jobs:
 
           tab_id=$(printf '%s' "$tab_response" | jq -er '.tabId')
 
-          echo "Waiting for the game to load..."
+          echo "Waiting for Craft World to load..."
           sleep 20
 
-          # Read page state without clicking anything.
           expression='JSON.stringify({
             url: location.href,
             title: document.title,
@@ -137,7 +136,7 @@ jobs:
           echo
 
           if [ "$state_code" != "200" ]; then
-            echo "Page inspection failed. Camofox logs:"
+            echo "Page inspection failed."
             tail -n 150 /tmp/camofox.log
             exit 1
           fi
@@ -161,18 +160,17 @@ jobs:
 
           if [[ "$page_url" != "https://craft-world.gg/" &&
                 "$page_url" != "https://craft-world.gg" ]]; then
-            echo "Unexpected page URL. No click will be attempted."
+            echo "Unexpected page URL. Stopping without clicking."
             exit 1
           fi
 
           if [ "$canvas_count" -lt 1 ] ||
              [ "$viewport_width" -lt 1000 ] ||
              [ "$viewport_height" -lt 700 ]; then
-            echo "Page checks failed. No click will be attempted."
+            echo "Canvas or viewport check failed."
             exit 1
           fi
 
-          # Save the actual screenshot before testing.
           before_code=$(curl -sS --max-time 30 --get \
             --data-urlencode "userId=$USER_ID" \
             -o "$OUT/before-click.png" \
@@ -182,7 +180,6 @@ jobs:
           echo "Before screenshot HTTP status: $before_code"
 
           if [ "$before_code" != "200" ]; then
-            echo "Screenshot request failed:"
             cat "$OUT/before-click.png" 2>/dev/null || true
             tail -n 100 /tmp/camofox.log
             exit 1
@@ -190,11 +187,10 @@ jobs:
 
           file "$OUT/before-click.png"
 
-          # Save identifiers for the next step.
           printf '%s\n' "$tab_id" > "$OUT/tab-id.txt"
           printf '%s\n' "$USER_ID" > "$OUT/user-id.txt"
 
-      - name: Attempt one guarded canvas click with diagnostics
+      - name: Attempt one guarded canvas click
         shell: bash
         run: |
           set -euo pipefail
@@ -213,7 +209,7 @@ jobs:
           viewport_height=$(printf '%s' "$state_json" \
             | jq -er '.viewport.height')
 
-          # Approximate target based on the previously supplied screenshot.
+          # Approximate target based on the screenshot supplied earlier.
           click_x=$(awk -v w="$viewport_width" \
             'BEGIN { printf "%d", w * 0.483 }')
           click_y=$(awk -v h="$viewport_height" \
@@ -222,8 +218,8 @@ jobs:
           echo "Viewport: ${viewport_width}x${viewport_height}"
           echo "Planned click: x=$click_x y=$click_y"
 
-          # Synthetic events are diagnostic only. Some games ignore them.
-          # Do not send events unless the target is the canvas.
+          # No "view: window" property: this fixes the reported exception.
+          # Synthetic events may still be ignored by the game.
           expression="(()=> {
             const x = $click_x;
             const y = $click_y;
@@ -238,56 +234,65 @@ jobs:
               });
             }
 
-            const common = {
+            const pointerOptions = {
               bubbles: true,
               cancelable: true,
               clientX: x,
               clientY: y,
               button: 0,
-              view: window
+              pointerId: 1,
+              pointerType: 'mouse',
+              isPrimary: true
             };
 
             el.dispatchEvent(new PointerEvent('pointermove', {
-              ...common,
-              pointerId: 1,
-              pointerType: 'mouse',
-              isPrimary: true,
+              ...pointerOptions,
               buttons: 0
             }));
 
             el.dispatchEvent(new MouseEvent('mousemove', {
-              ...common,
+              bubbles: true,
+              cancelable: true,
+              clientX: x,
+              clientY: y,
+              button: 0,
               buttons: 0
             }));
 
             el.dispatchEvent(new PointerEvent('pointerdown', {
-              ...common,
-              pointerId: 1,
-              pointerType: 'mouse',
-              isPrimary: true,
+              ...pointerOptions,
               buttons: 1
             }));
 
             el.dispatchEvent(new MouseEvent('mousedown', {
-              ...common,
+              bubbles: true,
+              cancelable: true,
+              clientX: x,
+              clientY: y,
+              button: 0,
               buttons: 1
             }));
 
             el.dispatchEvent(new PointerEvent('pointerup', {
-              ...common,
-              pointerId: 1,
-              pointerType: 'mouse',
-              isPrimary: true,
+              ...pointerOptions,
               buttons: 0
             }));
 
             el.dispatchEvent(new MouseEvent('mouseup', {
-              ...common,
+              bubbles: true,
+              cancelable: true,
+              clientX: x,
+              clientY: y,
+              button: 0,
               buttons: 0
             }));
 
             el.dispatchEvent(new MouseEvent('click', {
-              ...common,
+              bubbles: true,
+              cancelable: true,
+              clientX: x,
+              clientY: y,
+              button: 0,
               buttons: 0
             }));
 
@@ -296,15 +301,14 @@ jobs:
               method: 'synthetic canvas events',
               x, y,
               target: el.tagName,
-              warning: 'This is not a trusted physical mouse click'
+              warning: 'Game may ignore synthetic events'
             });
           })()"
 
-          echo "Sending the guarded test request..."
+          echo "Sending guarded test request..."
 
-          # Capture the response body even if Camofox returns HTTP 500.
           http_code=$(curl -sS --max-time 30 \
-            -o "$OUT/camofox-error.txt" \
+            -o "$OUT/camofox-response.txt" \
             -w '%{http_code}' \
             -X POST "$BASE_URL/tabs/$tab_id/evaluate" \
             -H 'Content-Type: application/json' \
@@ -316,7 +320,7 @@ jobs:
 
           echo "Camofox evaluate HTTP status: $http_code"
           echo "Camofox response body:"
-          cat "$OUT/camofox-error.txt" 2>/dev/null || true
+          cat "$OUT/camofox-response.txt" 2>/dev/null || true
           echo
 
           echo "Recent Camofox server log:"
@@ -324,11 +328,12 @@ jobs:
             | tee "$OUT/camofox-server.log"
 
           if [ "$http_code" != "200" ]; then
-            echo "Evaluate request failed. Stopping; no successful click is claimed."
+            echo "Evaluate failed. No successful click is claimed."
             exit 1
           fi
 
-          click_response=$(cat "$OUT/camofox-error.txt")
+          click_response=$(cat "$OUT/camofox-response.txt")
+
           printf '%s\n' "$click_response" \
             | tee "$OUT/click-response.json" | jq .
 
@@ -336,11 +341,11 @@ jobs:
             | jq -er '.result | fromjson')
 
           if [ "$(printf '%s' "$result" | jq -r '.ok')" != "true" ]; then
-            echo "Target check failed; no click events were sent."
+            echo "Target check failed; no events were sent."
             exit 1
           fi
 
-          echo "Test events were dispatched. Waiting five seconds..."
+          echo "Synthetic events dispatched. Waiting five seconds..."
           sleep 5
 
           after_code=$(curl -sS --max-time 30 --get \
@@ -352,8 +357,8 @@ jobs:
           echo "After screenshot HTTP status: $after_code"
 
           if [ "$after_code" != "200" ]; then
-            echo "Post-test screenshot failed."
             cat "$OUT/after-click.png" 2>/dev/null || true
+            tail -n 100 /tmp/camofox.log
             exit 1
           fi
 
@@ -369,12 +374,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
 
-      - name: Print Camofox logs
+      - name: Print final Camofox logs
         if: always()
         shell: bash
         run: |
           if [ -f /tmp/camofox.log ]; then
-            echo "Final Camofox log:"
             tail -n 150 /tmp/camofox.log
           else
             echo "Camofox log file not found."
