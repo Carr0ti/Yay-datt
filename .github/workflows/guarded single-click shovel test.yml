@@ -74,8 +74,9 @@ jobs:
           LOAD_TIMEOUT = 150          # seconds to wait for the game
           SETTLE_SECONDS = 5          # extra wait after "ready"
           MIN_BLOB = 300              # min yellow pixels to count as button
-          # ignore HUD: top bar and bottom menu (1920x1024 viewport)
-          Y_MIN, Y_MAX = 140, 940
+          # ignore HUD: top bar and bottom menu, as fractions of the screen
+          # height (Camofox picks a different window size on every run)
+          Y_MIN_FRAC, Y_MAX_FRAC = 0.14, 0.92
           CLICK_RETRIES = 3
           # ---------------------------------------------------------------
 
@@ -119,18 +120,19 @@ jobs:
 
 
           def is_loading_screen(img):
-              # pink progress bar of the loading screen
+              # pink progress bar: a row where over half the width is pink
               a = np.array(img).astype(int)
-              px = a[738, 700]
-              return px[0] > 200 and px[1] < 110 and px[2] < 130
+              m = (a[..., 0] > 200) & (a[..., 1] < 110) & (a[..., 2] < 130)
+              return bool((m.sum(axis=1) > a.shape[1] * 0.5).any())
 
 
           def find_yellow(img):
               a = np.array(img).astype(int)
               r, g, b = a[..., 0], a[..., 1], a[..., 2]
               m = (r > 230) & (g > 170) & (g < 215) & (b < 90)
-              m[:Y_MIN, :] = False
-              m[Y_MAX:, :] = False
+              h = m.shape[0]
+              m[:int(h * Y_MIN_FRAC), :] = False
+              m[int(h * Y_MAX_FRAC):, :] = False
               lab, n = ndimage.label(m)
               if n == 0:
                   return None
@@ -146,7 +148,7 @@ jobs:
               return """(() => {
                 const c = document.querySelector('canvas');
                 const o = {clientX:%d, clientY:%d, screenX:%d, screenY:%d,
-                  bubbles:true, cancelable:true, view:window, button:0,
+                  bubbles:true, cancelable:true, button:0,
                   buttons:%d, pointerId:1, pointerType:'mouse', isPrimary:true};
                 %s.forEach(t => {
                   const C = t.startsWith('pointer') ? PointerEvent : MouseEvent;
