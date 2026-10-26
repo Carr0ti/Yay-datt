@@ -1,4 +1,4 @@
-name: CW Click Yellow Button
+name: CW Click Yellow then Green Button
 
 on:
   workflow_dispatch:
@@ -126,10 +126,13 @@ jobs:
               return bool((m.sum(axis=1) > a.shape[1] * 0.5).any())
 
 
-          def find_yellow(img):
+          def find_button(img, kind):
               a = np.array(img).astype(int)
               r, g, b = a[..., 0], a[..., 1], a[..., 2]
-              m = (r > 230) & (g > 170) & (g < 215) & (b < 90)
+              if kind == "yellow":      # build (wrench) button
+                  m = (r > 230) & (g > 170) & (g < 215) & (b < 90)
+              else:                     # green play / earth mining button
+                  m = (g > 170) & (r < 110) & (b < 130) & (g - r > 90)
               h = m.shape[0]
               m[:int(h * Y_MIN_FRAC), :] = False
               m[int(h * Y_MAX_FRAC):, :] = False
@@ -197,29 +200,34 @@ jobs:
 
               time.sleep(SETTLE_SECONDS)
 
-              # ---- find + click yellow button ----
-              for attempt in range(1, CLICK_RETRIES + 1):
-                  img = screenshot(tab, f"before-{attempt}")
-                  hit = find_yellow(img)
-                  if not hit:
-                      print(f"attempt {attempt}: yellow button not found")
+              # ---- click yellow (build), then green (earth mining) ----
+              for kind in ("yellow", "green"):
+                  done = False
+                  for attempt in range(1, CLICK_RETRIES + 1):
+                      img = screenshot(tab, f"{kind}-before-{attempt}")
+                      hit = find_button(img, kind)
+                      if not hit:
+                          print(f"{kind} attempt {attempt}: button not found")
+                          time.sleep(3)
+                          continue
+
+                      x, y, size = hit
+                      print(f"{kind} attempt {attempt}: clicking ({x},{y}) size={size}")
+                      click(tab, x, y)
                       time.sleep(3)
-                      continue
 
-                  x, y, size = hit
-                  print(f"attempt {attempt}: clicking ({x},{y}) size={size}")
-                  click(tab, x, y)
-                  time.sleep(3)
+                      after = screenshot(tab, f"{kind}-after-{attempt}")
+                      hit2 = find_button(after, kind)
+                      if hit2 is None or abs(hit2[0] - x) + abs(hit2[1] - y) > 40:
+                          print(f"SUCCESS: {kind} button clicked, screen changed")
+                          done = True
+                          break
+                      print("button still there, retrying")
 
-                  after = screenshot(tab, f"after-{attempt}")
-                  hit2 = find_yellow(after)
-                  if hit2 is None or abs(hit2[0] - x) + abs(hit2[1] - y) > 40:
-                      print("SUCCESS: screen changed after click")
-                      return
-                  print("button still there, retrying")
-
-              print("FAILED: could not click the yellow button")
-              sys.exit(1)
+                  if not done:
+                      print(f"FAILED: could not click the {kind} button")
+                      sys.exit(1)
+                  time.sleep(2)
 
 
           main()
