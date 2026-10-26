@@ -1,5 +1,4 @@
-
-name: Diagnose CW Loading Screen
+name: CW Click Yellow Button
 
 on:
   workflow_dispatch:
@@ -8,18 +7,18 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+
+      - name: Install Python deps
+        run: pip install pillow numpy scipy
 
       - name: Install Camofox
         shell: bash
@@ -43,340 +42,203 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:9377/health \
-              > /tmp/camofox-health.txt 2>&1; then
-              cat /tmp/camofox-health.txt
+            if curl -fsS http://127.0.0.1:9377/health >/dev/null 2>&1; then
+              echo "Camofox is up"
               exit 0
             fi
-
             if ! kill -0 "$(cat /tmp/camofox.pid)" 2>/dev/null; then
               cat /tmp/camofox.log
               exit 1
             fi
-
             sleep 2
           done
-
           cat /tmp/camofox.log
           exit 1
 
-      - name: Open Craft World
+      - name: Write bot script
         shell: bash
         run: |
-          set -euo pipefail
+          mkdir -p /tmp/out
+          cat > /tmp/bot.py <<'PY'
+          import io, json, sys, time, urllib.parse, urllib.request
+          import numpy as np
+          from PIL import Image
+          from scipy import ndimage
 
-          BASE="http://127.0.0.1:9377"
-          OUT="/tmp/cw-diagnostics"
-          USER_ID="github-actions-cw-diagnostics"
-          SESSION_KEY="cw-loading-diagnostics"
+          BASE = "http://127.0.0.1:9377"
+          USER = "github-actions-cw"
+          OUT = "/tmp/out"
 
-          mkdir -p "$OUT"
-          echo "$USER_ID" > "$OUT/user-id.txt"
+          # ---- tunables -------------------------------------------------
+          LOAD_TIMEOUT = 150          # seconds to wait for the game
+          SETTLE_SECONDS = 5          # extra wait after "ready"
+          MIN_BLOB = 300              # min yellow pixels to count as button
+          # ignore HUD: top bar and bottom menu (1920x1024 viewport)
+          Y_MIN, Y_MAX = 140, 940
+          CLICK_RETRIES = 3
+          # ---------------------------------------------------------------
 
-          curl -fsS --max-time 60 \
-            -X POST "$BASE/tabs" \
-            -H 'Content-Type: application/json' \
-            -d "$(jq -cn \
-              --arg userId "$USER_ID" \
-              --arg sessionKey "$SESSION_KEY" \
-              --arg url "https://craft-world.gg/" \
-              '{userId:$userId,sessionKey:$sessionKey,url:$url}')" \
-            | tee "$OUT/tab-response.json" | jq .
 
-          TAB_ID=$(jq -er '.tabId' "$OUT/tab-response.json")
-          echo "$TAB_ID" > "$OUT/tab-id.txt"
+          def post(path, body, timeout=60):
+              req = urllib.request.Request(
+                  BASE + path,
+                  data=json.dumps(body).encode(),
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  return json.loads(r.read().decode())
 
-          echo "Waiting 30 seconds for Unity initialization..."
-          sleep 30
 
-          curl -sS --max-time 30 --get \
-            --data-urlencode "userId=$USER_ID" \
-            "$BASE/tabs/$TAB_ID/snapshot" \
-            -o "$OUT/accessibility-snapshot.json" || true
+          def evaluate(tab, expr):
+              res = post(f"/tabs/{tab}/evaluate",
+                         {"userId": USER, "expression": expr}, timeout=40)
+              return res.get("result")
 
-          echo "Accessibility snapshot:"
-          jq . "$OUT/accessibility-snapshot.json" 2>/dev/null \
-            || cat "$OUT/accessibility-snapshot.json" 2>/dev/null || true
 
-          curl -sS --max-time 30 --get \
-            --data-urlencode "userId=$USER_ID" \
-            -o "$OUT/before.png" \
-            -w '%{http_code}' \
-            "$BASE/tabs/$TAB_ID/screenshot" \
-            > "$OUT/before-screenshot-status.txt" || true
+          def screenshot(tab, name=None):
+              q = urllib.parse.urlencode({"userId": USER})
+              with urllib.request.urlopen(
+                      f"{BASE}/tabs/{tab}/screenshot?{q}", timeout=40) as r:
+                  data = r.read()
+              if name:
+                  open(f"{OUT}/{name}.png", "wb").write(data)
+              return Image.open(io.BytesIO(data)).convert("RGB")
 
-          echo "Screenshot HTTP status:"
-          cat "$OUT/before-screenshot-status.txt"
-          file "$OUT/before.png" 2>/dev/null || true
 
-      - name: Inspect Unity, WebGL, JavaScript and network
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BASE="http://127.0.0.1:9377"
-          OUT="/tmp/cw-diagnostics"
-          USER_ID=$(cat "$OUT/user-id.txt")
-          TAB_ID=$(cat "$OUT/tab-id.txt")
-
-          # Install instrumentation after navigation. This captures subsequent
-          # errors and resource failures, but cannot recover earlier errors.
-          expression='(() => {
-            if (!window.__cwDiag) {
-              window.__cwDiag = {
-                installedAt: new Date().toISOString(),
-                errors: [],
-                resourceErrors: [],
-                unhandledRejections: []
-              };
-
-              window.addEventListener("error", e => {
-                window.__cwDiag.errors.push({
-                  message: e.message || "resource error",
-                  filename: e.filename || "",
-                  line: e.lineno || 0,
-                  column: e.colno || 0,
-                  target: e.target?.src || e.target?.href || ""
-                });
-              }, true);
-
-              window.addEventListener("unhandledrejection", e => {
-                window.__cwDiag.unhandledRejections.push(
-                  String(e.reason?.stack || e.reason)
-                );
-              });
-
-              window.addEventListener("DOMContentLoaded", () => {
-                window.__cwDiag.domContentLoaded = true;
-              });
-            }
-
-            const canvases = [...document.querySelectorAll("canvas")].map(c => {
-              const r = c.getBoundingClientRect();
-              let webgl = {};
-              for (const kind of ["webgl2", "webgl", "experimental-webgl"]) {
-                try {
-                  const ctx = c.getContext(kind);
-                  webgl[kind] = !!ctx;
-                  if (ctx) {
-                    const gl = ctx;
-                    webgl.renderer = gl.getParameter(gl.RENDERER);
-                    webgl.vendor = gl.getParameter(gl.VENDOR);
-                    webgl.version = gl.getParameter(gl.VERSION);
-                    break;
-                  }
-                } catch (e) {
-                  webgl[kind] = "ERROR: " + e.message;
-                }
-              }
-              return {
-                width: c.width,
-                height: c.height,
-                rect: {x:r.x,y:r.y,width:r.width,height:r.height},
-                visible: !!(r.width && r.height),
-                webgl
-              };
-            });
-
-            const scripts = [...document.scripts].map(s => ({
-              src: s.src,
-              type: s.type,
-              loaded: !!s.src
-            }));
-
-            const unity = {};
-            for (const k of Object.keys(window)) {
-              if (/unity|webgl|loader|createUnityInstance/i.test(k)) {
-                try {
-                  unity[k] = typeof window[k];
-                } catch (_) {}
-              }
-            }
-
-            const resourceEntries = performance.getEntriesByType("resource");
-            const resources = resourceEntries.slice(-150).map(r => ({
-              name: r.name.slice(0, 300),
-              initiatorType: r.initiatorType,
-              durationMs: Math.round(r.duration),
-              transferSize: r.transferSize,
-              encodedBodySize: r.encodedBodySize,
-              decodedBodySize: r.decodedBodySize,
-              responseEnd: Math.round(r.responseEnd)
-            }));
-
-            const loadingElements = [...document.querySelectorAll(
-              "#unity-loading-bar,#unity-progress-bar-empty," +
-              "#unity-progress-bar-full,#unity-warning," +
-              "[id*=loading i],[class*=loading i]," +
-              "[id*=progress i],[class*=progress i]"
-            )].slice(0, 80).map(e => {
-              const r = e.getBoundingClientRect();
-              const cs = getComputedStyle(e);
-              return {
-                tag: e.tagName,
-                id: e.id,
-                className: String(e.className).slice(0, 150),
-                text: (e.innerText || e.textContent || "").slice(0, 300),
-                display: cs.display,
-                visibility: cs.visibility,
-                opacity: cs.opacity,
-                rect: {x:r.x,y:r.y,width:r.width,height:r.height}
-              };
-            });
-
+          READY_JS = """(() => {
+            const n = performance.getEntriesByType('resource').map(r => r.name);
             return JSON.stringify({
-              capturedAt: new Date().toISOString(),
-              url: location.href,
-              title: document.title,
-              readyState: document.readyState,
-              userAgent: navigator.userAgent,
-              platform: navigator.platform,
-              language: navigator.language,
-              viewport: {width:innerWidth,height:innerHeight},
-              devicePixelRatio,
-              visibilityState: document.visibilityState,
-              webgl: {
-                webglDisabled: (() => {
-                  try {
-                    const c = document.createElement("canvas");
-                    return !c.getContext("webgl") &&
-                           !c.getContext("webgl2");
-                  } catch (e) {
-                    return "ERROR: " + e.message;
-                  }
-                })(),
-                webglDebugExtensionAvailable: (() => {
-                  try {
-                    const c = document.createElement("canvas");
-                    const gl = c.getContext("webgl") ||
-                               c.getContext("webgl2");
-                    return !!gl && !!gl.getExtension("WEBGL_debug_renderer_info");
-                  } catch (_) {
-                    return false;
-                  }
-                })()
-              },
-              canvases,
-              scripts,
-              unityGlobals: unity,
-              loadingElements,
-              bodyText: (document.body?.innerText || "").slice(0, 5000),
-              resourceCount: resourceEntries.length,
-              resources,
-              instrumentation: window.__cwDiag
+              scene: n.some(x => x.includes('corescenes_scenes_mainscene')),
+              plot: n.some(x => x.includes('landplotearth.prefab')),
+              config: n.some(x => x.includes('client-config/config.json')),
+              canvas: document.querySelectorAll('canvas').length
             });
-          })()'
+          })()"""
 
-          for attempt in 1 2 3; do
-            echo "Diagnostic capture attempt $attempt"
 
-            code=$(curl -sS --max-time 40 \
-              -o "$OUT/diagnostics-response.json" \
-              -w '%{http_code}' \
-              -X POST "$BASE/tabs/$TAB_ID/evaluate" \
-              -H 'Content-Type: application/json' \
-              -d "$(jq -cn \
-                --arg userId "$USER_ID" \
-                --arg expression "$expression" \
-                '{userId:$userId,expression:$expression}')" || true)
+          def is_loading_screen(img):
+              # pink progress bar of the loading screen
+              a = np.array(img).astype(int)
+              px = a[738, 700]
+              return px[0] > 200 and px[1] < 110 and px[2] < 130
 
-            echo "HTTP status: $code"
 
-            if [ "$code" = "200" ]; then
-              break
-            fi
+          def find_yellow(img):
+              a = np.array(img).astype(int)
+              r, g, b = a[..., 0], a[..., 1], a[..., 2]
+              m = (r > 230) & (g > 170) & (g < 215) & (b < 90)
+              m[:Y_MIN, :] = False
+              m[Y_MAX:, :] = False
+              lab, n = ndimage.label(m)
+              if n == 0:
+                  return None
+              sizes = ndimage.sum(m, lab, range(1, n + 1))
+              best = int(np.argmax(sizes)) + 1
+              if sizes[best - 1] < MIN_BLOB:
+                  return None
+              cy, cx = ndimage.center_of_mass(m, lab, best)
+              return int(cx), int(cy), int(sizes[best - 1])
 
-            sleep 5
-          done
 
-          jq . "$OUT/diagnostics-response.json" 2>/dev/null \
-            || cat "$OUT/diagnostics-response.json" 2>/dev/null || true
+          def mouse_js(types, x, y, buttons):
+              return """(() => {
+                const c = document.querySelector('canvas');
+                const o = {clientX:%d, clientY:%d, screenX:%d, screenY:%d,
+                  bubbles:true, cancelable:true, view:window, button:0,
+                  buttons:%d, pointerId:1, pointerType:'mouse', isPrimary:true};
+                %s.forEach(t => {
+                  const C = t.startsWith('pointer') ? PointerEvent : MouseEvent;
+                  c.dispatchEvent(new C(t, o));
+                });
+                return 'ok';
+              })()""" % (x, y, x, y, buttons, json.dumps(types))
 
-          if [ "$code" = "200" ]; then
-            jq -r '.result // empty' "$OUT/diagnostics-response.json" \
-              > "$OUT/diagnostics.json" || true
 
-            if jq -e . "$OUT/diagnostics.json" >/dev/null 2>&1; then
-              echo "Parsed diagnostics:"
-              jq . "$OUT/diagnostics.json"
-            else
-              echo "Result was not directly parseable JSON."
-            fi
-          fi
+          def click(tab, x, y):
+              evaluate(tab, mouse_js(["pointermove", "mousemove"], x, y, 0))
+              evaluate(tab, mouse_js(["pointerdown", "mousedown"], x, y, 1))
+              time.sleep(0.15)
+              evaluate(tab, mouse_js(["pointerup", "mouseup", "click"], x, y, 0))
 
-          echo "Waiting 15 seconds to collect late errors..."
-          sleep 15
 
-          expression='JSON.stringify({
-            capturedAt: new Date().toISOString(),
-            url: location.href,
-            title: document.title,
-            readyState: document.readyState,
-            canvasCount: document.querySelectorAll("canvas").length,
-            instrumentation: window.__cwDiag || null,
-            recentResources: performance.getEntriesByType("resource")
-              .slice(-100).map(r => ({
-                name:r.name.slice(0,250),
-                durationMs:Math.round(r.duration),
-                transferSize:r.transferSize,
-                encodedBodySize:r.encodedBodySize
-              }))
-          })'
+          def main():
+              tab = post("/tabs", {
+                  "userId": USER,
+                  "sessionKey": "cw-click",
+                  "url": "https://craft-world.gg/",
+              })["tabId"]
+              print("tab:", tab)
 
-          curl -sS --max-time 40 \
-            -X POST "$BASE/tabs/$TAB_ID/evaluate" \
-            -H 'Content-Type: application/json' \
-            -d "$(jq -cn \
-              --arg userId "$USER_ID" \
-              --arg expression "$expression" \
-              '{userId:$userId,expression:$expression}')" \
-            -o "$OUT/late-diagnostics-response.json" || true
+              # ---- wait until inside the game ----
+              start = time.time()
+              ready = False
+              while time.time() - start < LOAD_TIMEOUT:
+                  time.sleep(3)
+                  try:
+                      st = json.loads(evaluate(tab, READY_JS))
+                      img = screenshot(tab)
+                  except Exception as e:
+                      print("poll error:", e)
+                      continue
+                  loading = is_loading_screen(img)
+                  print(f"{int(time.time()-start)}s net={st} loading={loading}")
+                  if st["scene"] and st["plot"] and st["config"] and not loading:
+                      ready = True
+                      break
 
-          jq . "$OUT/late-diagnostics-response.json" 2>/dev/null \
-            || cat "$OUT/late-diagnostics-response.json" 2>/dev/null || true
+              if not ready:
+                  screenshot(tab, "timeout")
+                  print("FAILED: game did not finish loading")
+                  sys.exit(1)
 
-          jq -r '.result // empty' "$OUT/late-diagnostics-response.json" \
-            > "$OUT/late-diagnostics.json" || true
+              time.sleep(SETTLE_SECONDS)
 
-          jq . "$OUT/late-diagnostics.json" 2>/dev/null || true
+              # ---- find + click yellow button ----
+              for attempt in range(1, CLICK_RETRIES + 1):
+                  img = screenshot(tab, f"before-{attempt}")
+                  hit = find_yellow(img)
+                  if not hit:
+                      print(f"attempt {attempt}: yellow button not found")
+                      time.sleep(3)
+                      continue
 
-          curl -sS --max-time 30 --get \
-            --data-urlencode "userId=$USER_ID" \
-            -o "$OUT/after.png" \
-            -w '%{http_code}' \
-            "$BASE/tabs/$TAB_ID/screenshot" \
-            > "$OUT/after-screenshot-status.txt" || true
+                  x, y, size = hit
+                  print(f"attempt {attempt}: clicking ({x},{y}) size={size}")
+                  click(tab, x, y)
+                  time.sleep(3)
 
-          echo "Final screenshot status:"
-          cat "$OUT/after-screenshot-status.txt"
-          file "$OUT/after.png" 2>/dev/null || true
+                  after = screenshot(tab, f"after-{attempt}")
+                  hit2 = find_yellow(after)
+                  if hit2 is None or abs(hit2[0] - x) + abs(hit2[1] - y) > 40:
+                      print("SUCCESS: screen changed after click")
+                      return
+                  print("button still there, retrying")
 
-      - name: Save server logs and runtime information
+              print("FAILED: could not click the yellow button")
+              sys.exit(1)
+
+
+          main()
+          PY
+
+      - name: Run bot
+        shell: bash
+        run: python3 /tmp/bot.py
+
+      - name: Save logs
         if: always()
         shell: bash
         run: |
-          mkdir -p /tmp/cw-diagnostics
+          mkdir -p /tmp/out
+          cp /tmp/camofox.log /tmp/out/camofox-server.log 2>/dev/null || true
 
-          if [ -f /tmp/camofox.log ]; then
-            cp /tmp/camofox.log /tmp/cw-diagnostics/camofox-server.log
-            tail -n 250 /tmp/camofox.log
-          fi
-
-          if [ -d /tmp/camofox-browser ]; then
-            cd /tmp/camofox-browser
-            node --version > /tmp/cw-diagnostics/node-version.txt
-            npm --version > /tmp/cw-diagnostics/npm-version.txt
-            npm list --depth=0 \
-              > /tmp/cw-diagnostics/npm-dependencies.txt 2>&1 || true
-          fi
-
-      - name: Upload diagnostic artifacts
+      - name: Upload screenshots and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: craft-world-loading-diagnostics
-          path: /tmp/cw-diagnostics/
+          name: cw-click-output
+          path: /tmp/out/
           if-no-files-found: warn
           retention-days: 3
